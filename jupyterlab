@@ -1,0 +1,241 @@
+!python -m pip install --user -U tpot
+from tpot import TPOTRegressor
+import pandas as pd
+
+import pandas as pd
+df = pd.read_csv(r"C:\Users\Hanafi_Majid\OneDrive - Dell Technologies\Documents\Thesis\datasets\csv_result-scm20d.csv")
+
+
+import pandas as pd
+#df = pd.read_csv("csv_result-scm20d.csv")
+df.head()
+y_col = [
+'LBL',
+'MTLp2A',
+'MTLp3A',
+'MTLp4A',
+'MTLp5A',
+'MTLp6A',
+'MTLp7A',
+'MTLp8A',
+'MTLp9A',
+'MTLp10A',
+'MTLp11A',
+'MTLp12A',
+'MTLp13A',
+'MTLp14A',
+'MTLp15A',
+'MTLp16A'
+]
+y = df[y_col]
+#x_col_id = ['id']
+#x_id = df[x_col_id]
+y.head()
+#X_col = ['Xloc','Yloc','Cr','Ni','Zn','Co']
+#X = df[X_col]
+#X = df[df.columns.drop(y)]
+#X=df.drop(columns=['id'])
+X=df[df.columns.drop(y)]
+#X=df.drop(y,x_id)
+y.head()
+
+
+from sklearn.model_selection import train_test_split
+X_train, X_test, y_train, y_test = train_test_split(
+X, y, test_size = 0.20, random_state = 123)
+X_train.fillna(X_train.mean(), inplace=True)
+X_test.fillna(X_test.mean(), inplace=True)
+y_train.fillna(y_train.mean(), inplace=True)
+y_test.fillna(y_test.mean(), inplace=True)
+from sklearn.preprocessing import MinMaxScaler
+from tpot import TPOTRegressor
+from sklearn.compose import TransformedTargetRegressor
+
+# Initialize the scaler
+scaler_X=MinMaxScaler(feature_range=(0,1))
+
+X_train = scaler_X.fit_transform(X_train)
+X_test  = scaler_X.transform(X_test)
+
+scaler_y = MinMaxScaler(feature_range=(0,1))
+y_train = scaler_y.fit_transform(y_train)
+y_test  = scaler_y.transform(y_test)
+
+
+
+from sklearn.svm import LinearSVR
+class MultiOutputTP(object):
+  def __init__(self, *args, **kwargs):
+    self.args = args
+    self.kwargs = kwargs
+  def fit(self, X, y):
+    X, y = map(np.atleast_2d, (X, y))
+    assert X.shape[0] == y.shape[0]
+    yy = y.shape[1]
+    self.regs = []
+    for i in range(yy):
+#while i <= Ny:
+      reg = TPOTRegressor(
+          generations=5, 
+          population_size=10, 
+          random_state=123, 
+          n_jobs=10,
+          max_time_mins=None, 
+          max_eval_time_mins=5, 
+          cv=10, 
+          verbose=3
+)
+      #reg = LinearSVR(epsilon=0.0, tol=0.0001, C=1.0, loss='epsilon_insensitive', fit_intercept=True, intercept_scaling=1.0, dual=True, verbose=1, random_state=123, max_iter=10000)
+      Xi = np.hstack([X, y[:, :i]])
+      yi = y[:, i]
+      self.regs.append(reg.fit(Xi, yi))
+
+
+    return self
+  def predict(self, X):
+    y = np.empty([X.shape[0], len(self.regs)])
+    for i, reg in enumerate(self.regs):
+      y[:, i] = reg.predict(np.hstack([X, y[:, :i]]))
+    return y
+
+
+
+import numpy as np
+from collections import deque
+
+def extract_fitted_pipelines(reg2):
+    """
+    Take your trained MultiOutputTP instance and extract the fitted sklearn pipelines
+    from each underlying TPOTRegressor.
+    """
+    pipes = []
+    for j, reg in enumerate(reg2.regs):
+        if not hasattr(reg, 'fitted_pipeline_'):
+            raise ValueError(f"TPOT regressor #{j} is not fitted or missing fitted_pipeline_.")
+        pipes.append(reg.fitted_pipeline_)
+    return pipes  # list length = n_targets
+
+class ChainedPipelines:
+    """
+    Reuses the set of per-target pipelines found by TPOT in a chained manner.
+    For target j, features are [X, predicted y_0..y_{j-1}].
+    """
+    def __init__(self, pipelines):
+        self.pipelines = pipelines
+        self.m = len(pipelines)
+
+    def predict_one(self, x_row):
+        yhat = np.zeros(self.m, dtype=float)
+        # sequentially predict targets using previous predictions as extra features
+        for j in range(self.m):
+            Xi = np.hstack([x_row, yhat[:j]])
+            yhat[j] = self.pipelines[j].predict(Xi.reshape(1, -1))[0]
+        return yhat
+
+    def refit(self, X_win, Y_win):
+        """
+        Refit each per-target pipeline on the current window with chaining:
+        target j sees [X, Y[:, :j]] as features and Y[:, j] as target.
+        """
+        for j, pipe in enumerate(self.pipelines):
+            Xi = np.hstack([X_win, Y_win[:, :j]])
+            yi = Y_win[:, j]
+            pipe.fit(Xi, yi)
+
+def prequential_stream(X_stream, Y_stream, pipelines,
+                       kappa=0.2, W=2000, T=200, min_batch=200, seed=42):
+    """
+    Prequential evaluation with stochastic label reveal.
+    - X_stream: (n_samples, n_features)
+    - Y_stream: (n_samples, n_targets)
+    - pipelines: list of fitted sklearn pipelines (one per target), from TPOT
+    - kappa: probability a sample's full row label is revealed (per-sample labeling)
+    - W: sliding window size for retraining
+    - T: retrain cadence (every T samples)
+    - min_batch: minimum labeled samples required before first refit
+    Returns:
+        preds: (n_samples, n_targets) predictions over time
+        avg_rmae: final average RMAE across targets
+        per_target_rmae: RMAE per target
+    """
+    rng = np.random.default_rng(seed)
+    m = Y_stream.shape[1]
+    chain = ChainedPipelines(pipelines)
+
+    X_buf = deque(maxlen=W)
+    Y_buf = deque(maxlen=W)
+
+    # Running baseline from *revealed* labels only (prequential denominator)
+    running_sum = np.zeros(m)
+    running_cnt = np.zeros(m)
+
+    # Accumulators for final RMAE: sum_i |y - yhat| and sum_i |y - ybar|
+    num_sums = np.zeros(m)
+    den_sums = np.zeros(m)
+
+    preds = []
+
+    for i in range(X_stream.shape[0]):
+        x_i = np.asarray(X_stream[i]).ravel()
+        y_i = np.asarray(Y_stream[i]).ravel()
+
+        # 1) Predict with current pipelines (or zeros before first refit)
+        yhat_i = chain.predict_one(x_i)
+        preds.append(yhat_i)
+
+        # 2) Reveal label with probability kappa (per-sample)
+        reveal = rng.random() < kappa
+        if reveal:
+            # Compute baseline BEFORE updating with current label
+            valid = running_cnt > 0
+            if valid.any():
+                ybar = np.zeros(m, dtype=float)
+                ybar[valid] = running_sum[valid] / running_cnt[valid]
+
+                num_sums[valid] += np.abs(y_i[valid] - yhat_i[valid])
+                den_sums[valid] += np.abs(y_i[valid] - ybar[valid])
+
+            # Update buffers and running baseline
+            X_buf.append(x_i)
+            Y_buf.append(y_i)
+            running_sum += y_i
+            running_cnt += 1
+
+        # 3) Periodic refit on the labeled window
+        if ((i + 1) % T == 0) and (len(X_buf) >= min_batch):
+            X_win = np.asarray(X_buf)
+            Y_win = np.asarray(Y_buf)
+            chain.refit(X_win, Y_win)
+
+    # Final RMAE (per target then averaged)
+    per_target_rmae = num_sums / np.where(den_sums == 0, np.nan, den_sums)
+    avg_rmae = np.nanmean(per_target_rmae)
+    return np.vstack(preds), avg_rmae, per_target_rmae
+``
+
+
+
+
+# 1) Train once with your code
+reg2 = MultiOutputTP(1).fit(X_train, y_train)
+
+# 2) Extract per-target pipelines from TPOT
+pipelines = extract_fitted_pipelines(reg2)
+
+# 3) Choose a stream (e.g., your X_test/y_test in row order; or the whole dataset in time order)
+X_stream = X_test  # already scaled the same way as training
+Y_stream = y_test
+
+# 4) Evaluate for different label ratios kappa
+for kappa in (0.1, 0.2, 0.5):
+    preds, avg_rmae, per_target = prequential_stream(
+        X_stream, Y_stream, pipelines,
+        kappa=kappa,
+        W=2000,   # sliding window size (tune to your memory/latency budget)
+        T=200,    # refit cadence (every 200 arrivals)
+        min_batch=200,
+        seed=123
+    )
+    print(f"κ={kappa}: Prequential Average RMAE = {avg_rmae:.6f}")
+    # If you scaled y with MinMax, preds are in scaled space; inverse-transform to original if needed
+    preds_orig = scaler_y.inverse_transform(preds)
